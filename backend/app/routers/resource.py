@@ -76,7 +76,8 @@ def export_entries(
 @router.get("/{module}/{entry_id}", response_model=dict)
 def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     service = require_service(module)
-    entry = service.get_entry(entry_id)
+    detail_loader = getattr(service, "entry_detail", None)
+    entry = detail_loader(entry_id) if callable(detail_loader) else service.get_entry(entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
     return entry

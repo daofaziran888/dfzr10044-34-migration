@@ -28,7 +28,14 @@ from typing import Any
 
 @dataclass
 class PartitionFile:
-    """分区文件：每个文件属于一个分区。"""
+    """分区文件：每个文件属于一个分区。
+
+    除物理文件标识外，这里同时承载“逻辑文件身份”与“代际位置”：
+    - logical_file_id: 同一个逻辑文件在冷热分层前后保持稳定的身份
+    - generation: 代际位置，0 为热层原始代，1+ 为冷层迁移后产生的代
+    - tier: hot | cold
+    - locator: 定位凭证，读取方据此定位到该代的物理位置
+    """
     file_id: str
     lake_table: str
     partition_key: str
@@ -36,6 +43,81 @@ class PartitionFile:
     file_bytes: int
     file_manifest: str  # 文件内容摘要（MD5）
     created_at: float
+    logical_file_id: str = ""
+    generation: int = 0
+    tier: str = "hot"
+    locator: str = ""
+    file_name: str = ""
+
+
+# ----------------------------- 存量清单 -----------------------------
+
+@dataclass
+class TierManifestEntry:
+    """存量清单条目：某逻辑文件在某一代际上的完整位置。"""
+    logical_file_id: str
+    generation: int
+    locator: str
+    rows: int
+    bytes: int
+    tier: str
+    file_id: str
+
+
+@dataclass
+class TierManifestVersion:
+    """存量清单版本：一次提交后的完整逻辑文件位置清单，可回查、可回退。"""
+    lake_table: str
+    version_id: str
+    version_number: int
+    entries: list["TierManifestEntry"]
+    status: str  # active | superseded | rolled_back
+    created_at: float
+    migration_ids: list[str] = field(default_factory=list)
+    note: str = ""
+    previous_version_id: str | None = None
+
+
+@dataclass
+class TierMigration:
+    """冷层迁移记录：热层某代文件迁移到冷层的可核对版本记录。"""
+    migration_id: str
+    lake_table: str
+    logical_file_id: str
+    source_file_id: str
+    source_generation: int
+    target_generation: int
+    target_file_id: str
+    source_bytes: int
+    target_bytes: int
+    rows: int
+    compression: str
+    state: str  # writing | receipt_pending | confirmed | canceled
+    receipt_state: str  # pending | received
+    savings_bytes: int
+    savings_accounted: bool
+    manifest_version: str
+    idempotency_key: str
+    snapshot_id: str | None
+    created_at: float
+    confirmed_at: float | None = None
+    canceled_at: float | None = None
+    receipt_received_at: float | None = None
+    reconciled_read_id: str | None = None
+
+
+@dataclass
+class ViewReadRecord:
+    """消费视图读取记录：绑定本次刷新实际读取到的位置版本，供迟到回执归账。"""
+    read_id: str
+    lake_table: str
+    view_snapshot: str | None
+    read_snapshot: str | None
+    read_manifest_version: str | None
+    location_versions: list[dict[str, Any]]
+    total_rows: int
+    created_at: float
+    reconciled_migration_ids: list[str] = field(default_factory=list)
 
 
 # ----------------------------- 快照 -----------------------------
@@ -148,13 +230,33 @@ class LakeStore:
         # 归并中断恢复检查点：merge_id -> {partial_file_ids: [...], ...}
         self._merge_checkpoints: dict[str, dict[str, Any]] = {}
 
+        # 存量清单版本：lake_table -> list[TierManifestVersion]（时间序）
+        self._tier_manifests: dict[str, list[TierManifestVersion]] = {}
+
+        # 冷层迁移记录：migration_id -> TierMigration
+        self._tier_migrations: dict[str, TierMigration] = {}
+
+        # 幂等键索引：(lake_table, idempotency_key) -> migration_id
+        self._tier_migration_keys: dict[tuple[str, str], str] = {}
+
+        # 消费视图读取记录：read_id -> ViewReadRecord
+        self._view_reads: dict[str, ViewReadRecord] = {}
+
     # ---- 文件操作 ----
 
     def register_file(
-        self, lake_table: str, partition_key: str, rows: int, bytes_: int, manifest: str | None = None
+        self, lake_table: str, partition_key: str, rows: int, bytes_: int, manifest: str | None = None,
+        *,
+        logical_file_id: str | None = None,
+        generation: int = 0,
+        tier: str = "hot",
+        file_name: str | None = None,
+        locator: str | None = None,
+        file_id: str | None = None,
     ) -> PartitionFile:
-        file_id = f"{lake_table}-p{partition_key}-{uuid.uuid4().hex[:8]}"
+        file_id = file_id or f"{lake_table}-p{partition_key}-{uuid.uuid4().hex[:8]}"
         checksum = manifest or hashlib.md5(f"{lake_table}:{partition_key}:{time.time()}".encode()).hexdigest()
+        name = file_name or f"{file_id}.parquet"
         pf = PartitionFile(
             file_id=file_id,
             lake_table=lake_table,
@@ -163,6 +265,11 @@ class LakeStore:
             file_bytes=bytes_,
             file_manifest=checksum,
             created_at=time.time(),
+            logical_file_id=logical_file_id or file_id,
+            generation=generation,
+            tier=tier,
+            locator=locator or f"/lake/{lake_table}/{partition_key}/{name}",
+            file_name=name,
         )
         self._files.setdefault(lake_table, {})[file_id] = pf
         return pf
@@ -392,6 +499,208 @@ class LakeStore:
 
     def release_write_lock(self, lake_table: str) -> None:
         self._write_lock.release(lake_table)
+
+    # ---- 存量清单与冷层迁移 ----
+
+    def _ensure_file_identity(self, f: PartitionFile) -> None:
+        """补齐逻辑文件身份、代际位置与定位凭证，兼容早期只登记物理文件的记录。"""
+        if not f.logical_file_id:
+            f.logical_file_id = f.file_id
+        if not f.locator:
+            f.locator = f"/lake/{f.lake_table}/{f.partition_key}/{f.file_id}.parquet"
+        if not f.file_name:
+            f.file_name = f"{f.file_id}.parquet"
+
+    def ensure_table_identity(self, lake_table: str) -> None:
+        for f in self.list_files(lake_table):
+            self._ensure_file_identity(f)
+
+    def get_active_manifest(self, lake_table: str) -> TierManifestVersion | None:
+        active = [v for v in self._tier_manifests.get(lake_table, []) if v.status == "active"]
+        return active[-1] if active else None
+
+    def get_manifest_version(self, lake_table: str, version_id: str) -> TierManifestVersion | None:
+        for version in self._tier_manifests.get(lake_table, []):
+            if version.version_id == version_id:
+                return version
+        return None
+
+    def list_manifest_versions(self, lake_table: str) -> list[TierManifestVersion]:
+        return list(self._tier_manifests.get(lake_table, []))
+
+    def publish_manifest(
+        self,
+        lake_table: str,
+        entries: list[TierManifestEntry],
+        migration_ids: list[str] | None = None,
+        note: str = "",
+    ) -> TierManifestVersion:
+        """发布一版存量清单：上一版转为 superseded 但仍可回查。"""
+        versions = self._tier_manifests.setdefault(lake_table, [])
+        previous = None
+        for version in versions:
+            if version.status == "active":
+                version.status = "superseded"
+                previous = version.version_id
+        number = max((v.version_number for v in versions), default=0) + 1
+        version = TierManifestVersion(
+            lake_table=lake_table,
+            version_id=f"tmn-{lake_table}-v{number:04d}",
+            version_number=number,
+            entries=[copy.copy(e) for e in entries],
+            status="active",
+            created_at=time.time(),
+            migration_ids=list(migration_ids or []),
+            note=note,
+            previous_version_id=previous,
+        )
+        versions.append(version)
+        return version
+
+    def build_manifest_entries(
+        self,
+        lake_table: str,
+        generation_by_logical: dict[str, int] | None = None,
+        only_logical_ids: set[str] | None = None,
+    ) -> list[TierManifestEntry]:
+        """按逻辑文件聚合物理文件，为每个逻辑文件选出目标代际的位置。
+
+        generation_by_logical 指定逻辑文件应落在哪一代；未指定时取该逻辑文件的最新代。
+        only_logical_ids 限定参与构建的逻辑文件（用于局部迁移），其余逻辑文件沿用当前清单。
+        """
+        self.ensure_table_identity(lake_table)
+        files = self.list_files(lake_table)
+        by_logical: dict[str, list[PartitionFile]] = {}
+        for f in files:
+            by_logical.setdefault(f.logical_file_id, []).append(f)
+
+        entries: list[TierManifestEntry] = []
+        for logical_id, gens in by_logical.items():
+            if only_logical_ids is not None and logical_id not in only_logical_ids:
+                continue
+            target_gen = (generation_by_logical or {}).get(logical_id)
+            if target_gen is None:
+                target_gen = max(f.generation for f in gens)
+            candidates = [f for f in gens if f.generation == target_gen]
+            if not candidates:
+                continue
+            chosen = candidates[-1]
+            entries.append(TierManifestEntry(
+                logical_file_id=logical_id,
+                generation=chosen.generation,
+                locator=chosen.locator,
+                rows=chosen.file_rows,
+                bytes=chosen.file_bytes,
+                tier=chosen.tier,
+                file_id=chosen.file_id,
+            ))
+        entries.sort(key=lambda e: e.logical_file_id)
+        return entries
+
+    def resolve_snapshot_locations(
+        self,
+        lake_table: str,
+        snapshot: LakeSnapshot,
+        manifest: TierManifestVersion | None = None,
+    ) -> list[dict[str, Any]]:
+        """把快照里的物理文件清单解析成同一逻辑文件的完整位置。
+
+        迁移后旧快照仍指向热层文件，这里按逻辑身份重定位到当前清单中的代际位置，
+        保证每个可读快照都能找到完整定位凭证与原始行数。
+        """
+        if manifest is None:
+            manifest = self.get_active_manifest(lake_table)
+        by_logical = (
+            {e.logical_file_id: e for e in manifest.entries} if manifest is not None else {}
+        )
+        resolved: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for fid in snapshot.file_ids:
+            f = self.get_file(lake_table, fid)
+            if f is None:
+                continue
+            self._ensure_file_identity(f)
+            logical_id = f.logical_file_id
+            if logical_id in seen:
+                continue
+            seen.add(logical_id)
+            entry = by_logical.get(logical_id)
+            if entry is not None:
+                resolved.append({
+                    "logical_file_id": entry.logical_file_id,
+                    "generation": entry.generation,
+                    "file_id": entry.file_id,
+                    "locator": entry.locator,
+                    "rows": entry.rows,
+                    "bytes": entry.bytes,
+                    "tier": entry.tier,
+                    "resolved_from_file_id": fid,
+                    "manifest_version": manifest.version_id if manifest else None,
+                })
+            else:
+                resolved.append({
+                    "logical_file_id": logical_id,
+                    "generation": f.generation,
+                    "file_id": f.file_id,
+                    "locator": f.locator,
+                    "rows": f.file_rows,
+                    "bytes": f.file_bytes,
+                    "tier": f.tier,
+                    "resolved_from_file_id": fid,
+                    "manifest_version": None,
+                })
+        return resolved
+
+    # ---- 冷层迁移记录 ----
+
+    def find_migration_by_key(self, lake_table: str, idempotency_key: str) -> TierMigration | None:
+        mid = self._tier_migration_keys.get((lake_table, idempotency_key))
+        return self._tier_migrations.get(mid) if mid else None
+
+    def register_tier_migration(self, migration: TierMigration) -> TierMigration:
+        self._tier_migrations[migration.migration_id] = migration
+        if migration.idempotency_key:
+            self._tier_migration_keys[
+                (migration.lake_table, migration.idempotency_key)
+            ] = migration.migration_id
+        return migration
+
+    def get_tier_migration(self, migration_id: str) -> TierMigration | None:
+        return self._tier_migrations.get(migration_id)
+
+    def list_tier_migrations(self, lake_table: str | None = None) -> list[TierMigration]:
+        values = list(self._tier_migrations.values())
+        if lake_table is not None:
+            values = [m for m in values if m.lake_table == lake_table]
+        return values
+
+    def migrations_for_manifest(self, lake_table: str, version_id: str) -> list[TierMigration]:
+        return [
+            m for m in self.list_tier_migrations(lake_table)
+            if m.manifest_version == version_id
+        ]
+
+    # ---- 消费视图读取记录 ----
+
+    def record_view_read(self, record: ViewReadRecord) -> ViewReadRecord:
+        self._view_reads[record.read_id] = record
+        return record
+
+    def get_view_read(self, read_id: str) -> ViewReadRecord | None:
+        return self._view_reads.get(read_id)
+
+    def list_view_reads(self, lake_table: str | None = None) -> list[ViewReadRecord]:
+        values = list(self._view_reads.values())
+        if lake_table is not None:
+            values = [r for r in values if r.lake_table == lake_table]
+        return values
+
+    def latest_view_read_for_manifest(self, lake_table: str, version_id: str) -> ViewReadRecord | None:
+        matches = [
+            r for r in self.list_view_reads(lake_table)
+            if r.read_manifest_version == version_id
+        ]
+        return matches[-1] if matches else None
 
     # ---- 统计快照 ----
 

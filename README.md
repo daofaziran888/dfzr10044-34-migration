@@ -74,12 +74,28 @@ npm run dev
 | 湖表审计 | `lake_audit` | 审计条目 | 条目编号、所属湖表、操作类型 |
 
 ## 约定
-
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
 - 每个模块仍保留独立`backend/app/services/<模块>.py`；纯前端保留
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 存储分层：存量清单与冷层迁移
+
+冷层迁移不再就地改写物理文件体积，而是保留热层原始代，另写一版带逻辑文件身份
+与代际位置的冷层文件，并发布一版存量清单（manifest version）。专用接口在
+`backend/app/routers/tier_ops.py`：
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /api/tier/migrations/run` | 迁移流水线（判定→迁移→发布清单→读取校验），同一份输入幂等 |
+| `GET /api/tier/migrations?lake_table=` | 迁移记录（源/目标代际、定位凭证、回执与归账状态） |
+| `POST /api/tier/migrations/{id}/cancel` | 取消本轮转换，清单还原到上一版 |
+| `POST /api/tier/views/refresh` | 消费视图刷新，记录实际读取的位置版本 |
+| `POST /api/tier/views/reconcile` | 迁移回执补到后回接到实际读取归账 |
+| `GET /api/tier/tables/{lake_table}/detail` | 详情页：逻辑文件代际位置、清单版本历史、冷层定位凭证 |
+
+存储分层详情页在行内「查看详情」展开，消费视图页提供「刷新读取」与「回执归账」。
 
 领域：数据工程
 子方向：数仓与数据湖

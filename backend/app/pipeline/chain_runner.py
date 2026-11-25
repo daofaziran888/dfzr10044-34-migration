@@ -532,31 +532,42 @@ def _step_storage_tier_hot_cold(ctx: ChainContext) -> ChainContext:
 
 
 def _step_migration_execute(ctx: ChainContext) -> ChainContext:
-    """冷热迁移执行：超期分区从热层迁到冷层。"""
+    """冷热迁移执行：超期分区从热层迁到冷层。
+
+    不再直接改写物理文件体积，而是为每个逻辑文件写入冷层新代际并发布存量清单，
+    让后续读取按「逻辑文件 + 代际位置」解析。
+    """
+    from app.services.storage_tier import StorageTierService
+
     lk = ctx.lake_table
-    files = lake_store.list_files(lk)
-    for f in files:
-        # 模拟压缩体积变化
-        f.file_bytes = max(1, f.file_bytes // 3)
-    ctx.output["migrated_file_count"] = len(files)
-    ctx.output["post_migration_bytes"] = sum(f.file_bytes for f in files)
+    result = StorageTierService().migrate_cold_files(
+        lk, "SNAPPY", note="链路9 冷热迁移"
+    )
+    ctx.output["migrated_file_count"] = result.get("migrated_file_count", 0)
+    ctx.output["manifest_version"] = result.get("manifest_version")
+    ctx.output["migrations"] = result.get("migrations", [])
+    manifest = lake_store.get_active_manifest(lk)
+    ctx.output["post_migration_bytes"] = (
+        sum(entry.bytes for entry in manifest.entries) if manifest else 0
+    )
     return ctx
 
 
 def _step_publish_view_refresh(ctx: ChainContext) -> ChainContext:
-    """消费视图发布：绑定最新可用快照，刷新下游视图。"""
+    """消费视图发布：按确认后的存量清单解析位置并刷新下游视图。"""
+    from app.services.publish_view import PublishViewService
+
     lk = ctx.lake_table
     snaps = lake_store.list_snapshots(lk)
     available = [s for s in snaps if s.status == "available"]
-    if available:
-        latest = available[-1]
-        ctx.output["view_snapshot"] = latest.snapshot_id
-        ctx.output["view_columns"] = ["event_time", "user_id", "action", "amount"]
-        ctx.output["downstream_consumer"] = "ADHOC_QUERY"
-    else:
-        ctx.output["view_snapshot"] = None
-        ctx.output["view_columns"] = []
-        ctx.output["downstream_consumer"] = "ADHOC_QUERY"
+    target = available[-1].snapshot_id if available else ""
+    refresh = PublishViewService().refresh_view(lk, target, "ADHOC_QUERY")
+    ctx.output["view_refresh"] = refresh
+    ctx.output["view_snapshot"] = refresh.get("refreshed_snapshot")
+    ctx.output["view_columns"] = ["event_time", "user_id", "action", "amount"]
+    ctx.output["downstream_consumer"] = "ADHOC_QUERY"
+    ctx.output["view_read_id"] = refresh.get("read_id")
+    ctx.output["view_manifest_version"] = refresh.get("manifest_version")
     return ctx
 
 
